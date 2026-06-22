@@ -299,6 +299,44 @@ static int add_queue_mes(struct device_queue_manager *dqm, struct queue *q,
 	return r;
 }
 
+/*
+ * Attempt a targeted MES reset of a single hardware queue. This is used as a
+ * recovery step when REMOVE_QUEUE fails because the queue is stuck mid-fault
+ * (e.g. a GPUVM permission fault on just-evicted SVM/userptr pages). Resetting
+ * the faulted queue quiesces it so the subsequent REMOVE_QUEUE can complete,
+ * avoiding a disruptive full-device GPU reset. Caller must hold the reset
+ * domain read lock. Returns 0 on success.
+ */
+static int reset_hw_queue_mes(struct device_queue_manager *dqm, struct queue *q,
+			      struct qcm_process_device *qpd)
+{
+	struct amdgpu_device *adev = (struct amdgpu_device *)dqm->dev->adev;
+	struct mes_reset_queue_input queue_input;
+	int queue_type;
+	int r;
+
+	if (!adev->mes.funcs || !adev->mes.funcs->reset_hw_queue)
+		return -EOPNOTSUPP;
+
+	queue_type = convert_to_mes_queue_type(q->properties.type);
+	if (queue_type < 0)
+		return -EINVAL;
+
+	memset(&queue_input, 0x0, sizeof(struct mes_reset_queue_input));
+	queue_input.xcc_id = ffs(dqm->dev->xcc_mask) - 1;
+	queue_input.queue_type = (uint32_t)queue_type;
+	queue_input.doorbell_offset = q->properties.doorbell_off;
+	queue_input.queue_id = q->properties.queue_id;
+	queue_input.mqd_addr = q->gart_mqd_addr;
+	queue_input.vmid = q->properties.vmid;
+
+	amdgpu_mes_lock(&adev->mes);
+	r = adev->mes.funcs->reset_hw_queue(&adev->mes, &queue_input);
+	amdgpu_mes_unlock(&adev->mes);
+
+	return r;
+}
+
 static int remove_queue_mes(struct device_queue_manager *dqm, struct queue *q,
 			struct qcm_process_device *qpd)
 {
@@ -319,6 +357,44 @@ static int remove_queue_mes(struct device_queue_manager *dqm, struct queue *q,
 	amdgpu_mes_lock(&adev->mes);
 	r = adev->mes.funcs->remove_hw_queue(&adev->mes, &queue_input);
 	amdgpu_mes_unlock(&adev->mes);
+
+	if (r) {
+		/*
+		 * REMOVE_QUEUE can fail when the queue is stuck mid-fault: a
+		 * GPUVM permission fault on SVM/userptr pages that were just
+		 * evicted (seen on unified-memory APUs under memory
+		 * oversubscription). In that state the MES scheduler stops
+		 * responding to REMOVE_QUEUE for the faulted queue. Before
+		 * escalating to a full GPU reset, try to quiesce the faulted
+		 * queue with a targeted MES queue reset and retry the removal
+		 * with remove_queue_after_reset set. This recovers the common
+		 * single-faulted-queue case without a disruptive MODE2 reset of
+		 * the whole device.
+		 */
+		dev_warn(adev->dev,
+			 "remove_hw_queue failed (doorbell=0x%x); attempting targeted queue reset\n",
+			 q->properties.doorbell_off);
+
+		if (reset_hw_queue_mes(dqm, q, qpd) == 0) {
+			memset(&queue_input, 0x0,
+			       sizeof(struct mes_remove_queue_input));
+			queue_input.doorbell_offset = q->properties.doorbell_off;
+			queue_input.gang_context_addr = q->gang_ctx_gpu_addr;
+			queue_input.xcc_id = ffs(dqm->dev->xcc_mask) - 1;
+			queue_input.remove_queue_after_reset = true;
+
+			amdgpu_mes_lock(&adev->mes);
+			r = adev->mes.funcs->remove_hw_queue(&adev->mes,
+							     &queue_input);
+			amdgpu_mes_unlock(&adev->mes);
+
+			if (!r)
+				dev_info(adev->dev,
+					 "recovered queue doorbell=0x%x via targeted reset, GPU reset avoided\n",
+					 q->properties.doorbell_off);
+		}
+	}
+
 	up_read(&adev->reset_domain->sem);
 
 	if (r) {
