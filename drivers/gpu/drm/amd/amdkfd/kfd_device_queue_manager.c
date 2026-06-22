@@ -307,8 +307,7 @@ static int add_queue_mes(struct device_queue_manager *dqm, struct queue *q,
  * avoiding a disruptive full-device GPU reset. Caller must hold the reset
  * domain read lock. Returns 0 on success.
  */
-static int reset_hw_queue_mes(struct device_queue_manager *dqm, struct queue *q,
-			      struct qcm_process_device *qpd)
+static int reset_hw_queue_mes(struct device_queue_manager *dqm, struct queue *q)
 {
 	struct amdgpu_device *adev = (struct amdgpu_device *)dqm->dev->adev;
 	struct mes_reset_queue_input queue_input;
@@ -375,12 +374,13 @@ static int remove_queue_mes(struct device_queue_manager *dqm, struct queue *q,
 			 "remove_hw_queue failed (doorbell=0x%x); attempting targeted queue reset\n",
 			 q->properties.doorbell_off);
 
-		if (reset_hw_queue_mes(dqm, q, qpd) == 0) {
-			memset(&queue_input, 0x0,
-			       sizeof(struct mes_remove_queue_input));
-			queue_input.doorbell_offset = q->properties.doorbell_off;
-			queue_input.gang_context_addr = q->gang_ctx_gpu_addr;
-			queue_input.xcc_id = ffs(dqm->dev->xcc_mask) - 1;
+		if (reset_hw_queue_mes(dqm, q) == 0) {
+			/*
+			 * Re-issue the removal on the now-reset queue. queue_input
+			 * still holds the same doorbell/gang/xcc values from the
+			 * first attempt (remove_hw_queue only reads it), so just
+			 * flag that the queue has been reset.
+			 */
 			queue_input.remove_queue_after_reset = true;
 
 			amdgpu_mes_lock(&adev->mes);
