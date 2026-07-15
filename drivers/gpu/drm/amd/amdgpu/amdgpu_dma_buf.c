@@ -322,8 +322,17 @@ static int amdgpu_dma_buf_pin(struct dma_buf_attachment *attach)
 				domains &= ~AMDGPU_GEM_DOMAIN_VRAM;
 	}
 
-	if (domains & AMDGPU_GEM_DOMAIN_VRAM)
+	if (domains & AMDGPU_GEM_DOMAIN_VRAM &&
+	    !(bo->flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED)) {
+		/*
+		 * Temporarily force CPU access so the BO can be placed in
+		 * the CPU-visible VRAM window for P2P.  Remember that we
+		 * forced it so amdgpu_dma_buf_unpin() can undo it and keep
+		 * the dma-buf export state-neutral for the exported BO.
+		 */
 		bo->flags |= AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+		bo->dmabuf_cpu_access_forced = true;
+	}
 
 	if (WARN_ON(!domains))
 		return -EINVAL;
@@ -344,6 +353,18 @@ static void amdgpu_dma_buf_unpin(struct dma_buf_attachment *attach)
 	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
 
 	amdgpu_bo_unpin(bo);
+
+	/*
+	 * Restore the original flag state if we forced CPU access in
+	 * amdgpu_dma_buf_pin().  Leaving CPU_ACCESS_REQUIRED set would
+	 * permanently narrow the BO's VRAM placement to the visible
+	 * window and perturb subsequent VRAM/scratch allocations for
+	 * KFD-owned BOs.
+	 */
+	if (bo->dmabuf_cpu_access_forced && !bo->tbo.pin_count) {
+		bo->flags &= ~AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+		bo->dmabuf_cpu_access_forced = false;
+	}
 }
 #endif
 
@@ -379,7 +400,12 @@ static struct sg_table *amdgpu_dma_buf_map(struct dma_buf_attachment *attach,
 #ifdef HAVE_STRUCT_DMA_BUF_ATTACH_OPS_ALLOW_PEER2PEER
 		if (bo->preferred_domains & AMDGPU_GEM_DOMAIN_VRAM &&
 		    attach->peer2peer) {
-			bo->flags |= AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+			if (!(bo->flags &
+			      AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED)) {
+				bo->flags |=
+					AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+				bo->dmabuf_cpu_access_forced = true;
+			}
 			domains |= AMDGPU_GEM_DOMAIN_VRAM;
 		}
 #endif
@@ -467,6 +493,18 @@ static void amdgpu_dma_buf_unmap(struct dma_buf_attachment *attach,
 #ifndef HAVE_STRUCT_DMA_BUF_OPS_PIN
 	amdgpu_bo_unpin(bo);
 #endif
+
+	/*
+	 * If amdgpu_dma_buf_map() forced CPU access to place this BO in
+	 * the visible VRAM window for P2P, restore the original flag once
+	 * the mapping is gone and the BO is not otherwise pinned.  This
+	 * keeps dma-buf export/registration state-neutral for the BO and
+	 * avoids corrupting subsequent VRAM/scratch allocations.
+	 */
+	if (bo->dmabuf_cpu_access_forced && !bo->tbo.pin_count) {
+		bo->flags &= ~AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+		bo->dmabuf_cpu_access_forced = false;
+	}
 }
 #endif
 

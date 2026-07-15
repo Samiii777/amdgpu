@@ -129,6 +129,16 @@ struct amdgpu_bo {
 	struct kgd_mem                  *kfd_bo;
 
 	/*
+	 * Set when the dma-buf pin/map path temporarily forced
+	 * AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED on this BO to allow VRAM P2P.
+	 * Used to restore the original flag state on unpin/unmap so that
+	 * exporting/registering a VRAM BO as a dma-buf is state-neutral and
+	 * does not permanently narrow the BO's VRAM placement window.
+	 * Protected by tbo.reserved.
+	 */
+	bool				dmabuf_cpu_access_forced;
+
+	/*
 	 * For GPUs with spatial partitioning, xcp partition number, -1 means
 	 * any partition. For other ASICs without spatial partition, always 0
 	 * for memory accounting.
