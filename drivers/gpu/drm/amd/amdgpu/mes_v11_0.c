@@ -1876,8 +1876,15 @@ static int mes_v11_0_hw_init(struct amdgpu_ip_block *ip_block)
 	int r;
 	struct amdgpu_device *adev = ip_block->adev;
 
-	if (adev->mes.ring[0].sched.ready)
+	if (adev->mes.ring[0].sched.ready && !amdgpu_in_reset(adev))
 		goto out;
+
+	/*
+	 * On the GPU reset path the scheduler ring is stale even though
+	 * sched.ready may still be set, so clear it and fall through to
+	 * fully reinitialize the ring below.
+	 */
+	adev->mes.ring[0].sched.ready = false;
 
 	if (!adev->enable_mes_kiq) {
 		if (adev->firmware.load_type == AMDGPU_FW_LOAD_DIRECT) {
