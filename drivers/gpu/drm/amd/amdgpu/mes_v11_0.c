@@ -254,6 +254,18 @@ static int mes_v11_0_submit_pkt_and_poll_completion(struct amdgpu_mes *mes,
 			x_pkt->header.opcode);
 
 	r = amdgpu_fence_wait_polling(ring, seq, timeout);
+
+	/*
+	 * Without MES per-queue reset, a REMOVE_QUEUE timeout escalates to a
+	 * full GPU reset. Preempting a queue whose waves are stalled on a VM
+	 * fault can exceed the default timeout while other queues are busy.
+	 */
+	if (r < 1 && x_pkt->header.opcode == MES_SCH_API_REMOVE_QUEUE &&
+	    !amdgpu_mes_queue_reset_by_mes_supported(adev)) {
+		dev_warn(adev->dev, "MES slow to respond to msg=REMOVE_QUEUE, extending wait\n");
+		r = amdgpu_fence_wait_polling(ring, seq, timeout * 4);
+	}
+
 	if (r < 1 || !*status_ptr) {
 
 		if (misc_op_str)
